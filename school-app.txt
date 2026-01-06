@@ -1,0 +1,471 @@
+import os
+from datetime import datetime
+from flask import Flask, render_template_string, request, redirect, url_for
+from flask_sqlalchemy import SQLAlchemy
+
+# ==========================================
+# 1. إعدادات التطبيق وقاعدة البيانات
+# ==========================================
+app = Flask(__name__)
+# استخدام قاعدة بيانات SQLite محلية (ملف واحد)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///school_quality.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.secret_key = 'secret_key_for_session'
+
+db = SQLAlchemy(app)
+
+# ==========================================
+# 2. هيكل البيانات (Models) - مطابق للملف المرفق
+# ==========================================
+
+# الثوابت (الأقسام والمناصب)
+DEPARTMENTS = {
+    'AR': 'اللغة العربية',
+    'MATH_SC': 'الرياضيات والعلوم',
+    'ENG': 'اللغة الإنجليزية',
+    'ISLAMIC': 'التربية الإسلامية',
+    'SOC': 'المواد الاجتماعية',
+    'CLASS_SYS': 'نظام فصل',
+    'ENRICH': 'المواد الإثرائية',
+    'SPORT': 'التربية الرياضية'
+}
+
+ROLES = {
+    'PRINCIPAL': 'مدير المدرسة',
+    'ASST_PRIN': 'المدير المساعد',
+    'SENIOR_T': 'معلم أول / منسق'
+}
+
+RATINGS = {
+    4: 'يفوق التوقعات بكثير',
+    3: 'يفوق التوقعات',
+    2: 'يفي بالتوقعات',
+    1: 'يفي بالتوقعات جزئياً'
+}
+
+# جدول المعلمين
+class Teacher(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    department = db.Column(db.String(20), nullable=False) # Code from DEPARTMENTS
+
+# جدول الزيارات الصفية 
+class Visit(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    visitor_name = db.Column(db.String(100))
+    visitor_role = db.Column(db.String(20)) # Code from ROLES
+    teacher_id = db.Column(db.Integer, db.ForeignKey('teacher.id'))
+    teacher = db.relationship('Teacher', backref='visits')
+    date = db.Column(db.Date, default=datetime.utcnow)
+    rating = db.Column(db.Integer) # 1 to 4
+    notes = db.Column(db.Text, nullable=True)
+
+# جدول متابعة القيادة العليا للوسطى 
+class MiddleLeadershipTracking(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    department = db.Column(db.String(20), unique=True)
+    visit_forms_count = db.Column(db.Integer, default=0)
+    has_meeting_minutes = db.Column(db.Boolean, default=False)
+    has_weekly_plan = db.Column(db.Boolean, default=False)
+    reason_for_missing = db.Column(db.String(200), default="")
+
+# جدول التقرير النوعي 
+class QualitativeReport(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    department = db.Column(db.String(20))
+    strengths = db.Column(db.Text, default="")
+    improvements = db.Column(db.Text, default="")
+
+# ==========================================
+# 3. قوالب HTML (مدمجة داخل الكود للسهولة)
+# ==========================================
+
+# التصميم العام ولوحة التحكم
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+    <meta charset="UTF-8">
+    <title>نظام جودة التعليم</title>
+    <style>
+        body { font-family: Tahoma, sans-serif; background: #f4f4f4; padding: 20px; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px #ccc; }
+        h1 { color: #2c3e50; text-align: center; }
+        .btn { display: inline-block; padding: 10px 20px; margin: 5px; background: #3498db; color: white; text-decoration: none; border-radius: 5px; }
+        .btn-green { background: #27ae60; }
+        .btn-red { background: #c0392b; }
+        form { margin-top: 20px; border-top: 1px solid #eee; padding-top: 20px; }
+        input, select, textarea { width: 100%; padding: 10px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>نظام تتبع جودة التعليم والتعلم</h1>
+        <div style="text-align: center;">
+            <a href="{{ url_for('report_view') }}" class="btn btn-green" target="_blank">📄 عرض وطباعة التقرير الرسمي</a>
+            <a href="{{ url_for('setup_data') }}" class="btn btn-red">⚠️ إعادة ضبط / إضافة بيانات تجريبية</a>
+        </div>
+
+        <h3>تسجيل زيارة صفية جديدة:</h3>
+        <form method="POST" action="{{ url_for('add_visit') }}">
+            <label>اسم الزائر:</label>
+            <input type="text" name="visitor_name" required>
+            
+            <label>صفة الزائر:</label>
+            <select name="visitor_role">
+                {% for code, name in roles.items() %}
+                <option value="{{ code }}">{{ name }}</option>
+                {% endfor %}
+            </select>
+
+            <label>المعلم (اختر من القائمة أو سيتم إنشاؤه):</label>
+            <select name="teacher_id" required>
+                {% for t in teachers %}
+                <option value="{{ t.id }}">{{ t.name }} - {{ depts[t.department] }}</option>
+                {% endfor %}
+            </select>
+
+            <label>تاريخ الزيارة:</label>
+            <input type="date" name="date" required>
+
+            <label>التقييم:</label>
+            <select name="rating">
+                {% for score, text in ratings.items() %}
+                <option value="{{ score }}">{{ score }} - {{ text }}</option>
+                {% endfor %}
+            </select>
+
+            <label>ملاحظات (للمعلم الأولى بالرعاية):</label>
+            <textarea name="notes"></textarea>
+
+            <button type="submit" class="btn">حفظ الزيارة</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+# قالب التقرير الرسمي (مطابق للملف المرفق 100%)
+REPORT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>تقرير تتبع الجودة</title>
+    <style>
+        @page { size: A4; margin: 1cm; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 11px; margin: 0; }
+        
+        /* Header Styles */
+        .header-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 2px solid #ccc; padding-bottom: 10px; }
+        .logo-text { text-align: center; font-weight: bold; }
+        
+        .report-title-box { text-align: center; border: 2px solid #000; padding: 10px; margin: 10px 0; background: #f9f9f9; }
+        .report-title-box h2 { margin: 5px 0; font-size: 16px; }
+
+        /* Table Styles to match Word Document */
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; page-break-inside: avoid; }
+        th, td { border: 1px solid #000; padding: 4px; text-align: center; vertical-align: middle; }
+        th { background-color: #e6e6e6; font-weight: bold; }
+        
+        .section-header { background-color: #d9d9d9; padding: 5px; font-weight: bold; margin-top: 15px; border: 1px solid #000; margin-bottom: 5px; }
+
+        .align-right { text-align: right; }
+        
+        @media print {
+            .no-print { display: none; }
+            button { display: none; }
+        }
+    </style>
+</head>
+<body>
+
+    <button onclick="window.print()" style="padding: 10px; background: blue; color: white; width: 100%; font-size: 16px;">اضغط هنا لطباعة التقرير / حفظ PDF</button>
+
+    <div class="header-container">
+        <div class="logo-text">Ministry of Education<br>Kingdom of Bahrain</div>
+        <div class="logo-text">وزارة التربية والتعليم<br>مملكة البحرين</div>
+    </div>
+
+    <div class="report-title-box">
+        <h2>تقرير متابعة جودة التعليم والتعلم للقيادة العليا والوسطى</h2>
+        <p>لمدرسة: <b>مدرسة المستقبل الثانوية</b> &nbsp;|&nbsp; شهر: <b>{{ current_month }}</b> &nbsp;|&nbsp; العام الدراسي: <b>2026/2025م</b></p>
+    </div>
+    <div class="align-right">إعداد المدير المساعد / يعتمد، مدير المدرسة</div>
+
+    <div class="section-header">أولاً: متابعة تسليم القيادة الوسطى (الزيارات/محاضر الاجتماعات/الخطة)</div>
+    <table>
+        <thead>
+            <tr>
+                <th rowspan="2">القسم</th>
+                <th colspan="3">متابعة القيادة العليا للقيادة الوسطى</th>
+                <th rowspan="2">أسباب عدم التسليم</th>
+            </tr>
+            <tr>
+                <th>عدد الاستمارات المنفذة</th>
+                <th>محضر اجتماع</th>
+                <th>خطة أسبوعية</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in tracking %}
+            <tr>
+                <td class="align-right">{{ depts[item.department] }}</td>
+                <td>{{ item.visit_forms_count }}</td>
+                <td>{{ '✓' if item.has_meeting_minutes else '✗' }}</td>
+                <td>{{ '✓' if item.has_weekly_plan else '✗' }}</td>
+                <td>{{ item.reason_for_missing }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="section-header">ثانياً: عدد الزيارات التي نفذت</div>
+    <p>1- القيادة العليا = <b>{{ senior_visits_count }}</b> &nbsp;&nbsp;&nbsp;&nbsp; 2- القيادة الوسطى = <b>{{ middle_visits_count }}</b></p>
+
+    <div class="section-header">ثالثاً: بيان أسماء المعلمين المُزارين من قبل القيادة العليا والوسطى</div>
+    <table>
+        <thead>
+            <tr>
+                <th>ت</th>
+                <th>اسم المعلم</th>
+                <th>القسم</th>
+                <th>تاريخ الزيارة</th>
+                <th>تقييم الزيارة</th>
+                <th>اسم الزائر</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for visit in visits %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td class="align-right">{{ visit.teacher.name }}</td>
+                <td>{{ depts[visit.teacher.department] }}</td>
+                <td>{{ visit.date.strftime('%Y-%m-%d') }}</td>
+                <td>{{ ratings[visit.rating] }}</td>
+                <td>{{ visit.visitor_name }} <br><span style="font-size:9px;">({{ roles[visit.visitor_role] }})</span></td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">لا توجد زيارات مسجلة</td></tr>
+            {% endfor %}
+            <tr>
+                <td colspan="6" style="background:#eee;"><b>مجموع الزيارات الكلية = {{ visits|length }}</b></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="section-header">رابعاً: عدد الزيارات الصفية وتقييم الأداء الصفي</div>
+    <table>
+        <thead>
+            <tr>
+                <th rowspan="2">م</th>
+                <th rowspan="2">الأقسام الأكاديمية</th>
+                <th rowspan="2">مجموع الزيارات</th>
+                <th colspan="4">مستويات الأداء</th>
+            </tr>
+            <tr>
+                <th>يفوق التوقعات بكثير</th>
+                <th>يفوق التوقعات</th>
+                <th>يفي بالتوقعات</th>
+                <th>يفي جزئياً</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for stat in stats %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td class="align-right">{{ stat['name'] }}</td>
+                <td>{{ stat['total'] }}</td>
+                <td>{{ stat['exceeds_lot'] }}</td>
+                <td>{{ stat['exceeds'] }}</td>
+                <td>{{ stat['meets'] }}</td>
+                <td>{{ stat['partial'] }}</td>
+            </tr>
+            {% endfor %}
+            <tr style="background:#f2f2f2; font-weight:bold;">
+                <td colspan="2">المجموع الكلي</td>
+                <td>{{ total_stats['total'] }}</td>
+                <td>{{ total_stats['exceeds_lot'] }}</td>
+                <td>{{ total_stats['exceeds'] }}</td>
+                <td>{{ total_stats['meets'] }}</td>
+                <td>{{ total_stats['partial'] }}</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div style="page-break-after: always;"></div>
+
+    <div class="section-header">سادساً: حصر أسماء المعلمين المتميزين (يفوق التوقعات بكثير)</div>
+    <table>
+        <thead>
+            <tr>
+                <th>اسم المعلم</th>
+                <th>القسم الأكاديمي</th>
+                <th>التقدير</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for v in distinguished %}
+            <tr>
+                <td class="align-right">{{ v.teacher.name }}</td>
+                <td>{{ depts[v.teacher.department] }}</td>
+                <td>{{ ratings[v.rating] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="section-header">حصر أسماء المعلمين الأولى بالرعاية (يفي جزئياً)</div>
+    <table>
+        <thead>
+            <tr>
+                <th>اسم المعلم</th>
+                <th>القسم الأكاديمي</th>
+                <th>المبررات (الملاحظات)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for v in needs_support %}
+            <tr>
+                <td class="align-right">{{ v.teacher.name }}</td>
+                <td>{{ depts[v.teacher.department] }}</td>
+                <td>{{ v.notes }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="section-header">سابعاً: التقرير النوعي (جوانب القوة والتطوير)</div>
+    <table>
+        <thead>
+            <tr>
+                <th>القسم الأكاديمي</th>
+                <th>جوانب القوة</th>
+                <th>جوانب بحاجة إلى تطوير</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for q in qualitative %}
+            <tr>
+                <td class="align-right">{{ depts[q.department] }}</td>
+                <td>{{ q.strengths }}</td>
+                <td>{{ q.improvements }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>
+"""
+
+# ==========================================
+# 4. منطق التطبيق (Routes)
+# ==========================================
+
+@app.route('/')
+def dashboard():
+    teachers = Teacher.query.all()
+    return render_template_string(DASHBOARD_TEMPLATE, teachers=teachers, roles=ROLES, ratings=RATINGS, depts=DEPARTMENTS)
+
+@app.route('/add_visit', methods=['POST'])
+def add_visit():
+    teacher_id = request.form.get('teacher_id')
+    visit = Visit(
+        visitor_name=request.form.get('visitor_name'),
+        visitor_role=request.form.get('visitor_role'),
+        teacher_id=teacher_id,
+        date=datetime.strptime(request.form.get('date'), '%Y-%m-%d'),
+        rating=int(request.form.get('rating')),
+        notes=request.form.get('notes')
+    )
+    # تحديث عداد الزيارات في جدول المتابعة
+    teacher = Teacher.query.get(teacher_id)
+    tracking = MiddleLeadershipTracking.query.filter_by(department=teacher.department).first()
+    if tracking and request.form.get('visitor_role') == 'SENIOR_T':
+        tracking.visit_forms_count += 1
+    
+    db.session.add(visit)
+    db.session.commit()
+    return redirect(url_for('dashboard'))
+
+@app.route('/report')
+def report_view():
+    # 1. جلب بيانات المتابعة
+    tracking = MiddleLeadershipTracking.query.all()
+    
+    # 2. جلب جميع الزيارات مرتبة
+    visits = Visit.query.join(Teacher).order_by(Visit.visitor_role, Visit.date).all()
+    
+    # حساب عدد زيارات القيادة العليا والوسطى 
+    senior_visits = Visit.query.filter(Visit.visitor_role.in_(['PRINCIPAL', 'ASST_PRIN'])).count()
+    middle_visits = Visit.query.filter(Visit.visitor_role == 'SENIOR_T').count()
+
+    # 3. حساب الإحصائيات للأقسام 
+    stats = []
+    total_stats = {'total': 0, 'exceeds_lot': 0, 'exceeds': 0, 'meets': 0, 'partial': 0}
+    
+    for code, name in DEPARTMENTS.items():
+        dept_visits = Visit.query.join(Teacher).filter(Teacher.department == code).all()
+        row = {
+            'name': name,
+            'total': len(dept_visits),
+            'exceeds_lot': sum(1 for v in dept_visits if v.rating == 4),
+            'exceeds': sum(1 for v in dept_visits if v.rating == 3),
+            'meets': sum(1 for v in dept_visits if v.rating == 2),
+            'partial': sum(1 for v in dept_visits if v.rating == 1),
+        }
+        stats.append(row)
+        # تجميع الكلي
+        total_stats['total'] += row['total']
+        total_stats['exceeds_lot'] += row['exceeds_lot']
+        total_stats['exceeds'] += row['exceeds']
+        total_stats['meets'] += row['meets']
+        total_stats['partial'] += row['partial']
+
+    # 4. المعلمين المتميزين والأولى بالرعاية
+    distinguished = Visit.query.filter_by(rating=4).join(Teacher).all()
+    needs_support = Visit.query.filter_by(rating=1).join(Teacher).all()
+
+    # 5. التقرير النوعي
+    qualitative = QualitativeReport.query.all()
+
+    return render_template_string(REPORT_TEMPLATE,
+                                  tracking=tracking,
+                                  visits=visits,
+                                  stats=stats,
+                                  total_stats=total_stats,
+                                  senior_visits_count=senior_visits,
+                                  middle_visits_count=middle_visits,
+                                  distinguished=distinguished,
+                                  needs_support=needs_support,
+                                  qualitative=qualitative,
+                                  depts=DEPARTMENTS, ratings=RATINGS, roles=ROLES,
+                                  current_month=datetime.now().strftime("%B"))
+
+# دالة مساعدة لتهيئة البيانات (Setup)
+@app.route('/setup')
+def setup_data():
+    with app.app_context():
+        db.create_all()
+        
+        # إضافة أقسام للمتابعة إذا لم تكن موجودة
+        if not MiddleLeadershipTracking.query.first():
+            for code in DEPARTMENTS.keys():
+                db.session.add(MiddleLeadershipTracking(department=code))
+                db.session.add(QualitativeReport(department=code, strengths="يوجد تعاون ملحوظ", improvements="متابعة التحصيل"))
+        
+        # إضافة معلمين تجريبيين
+        if not Teacher.query.first():
+            db.session.add(Teacher(name="أحمد محمد", department="MATH_SC"))
+            db.session.add(Teacher(name="سارة علي", department="AR"))
+            db.session.add(Teacher(name="محمود حسن", department="ENG"))
+        
+        db.session.commit()
+    return redirect(url_for('dashboard'))
+
+if __name__ == '__main__':
+    # إنشاء الجداول عند بدء التشغيل
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
